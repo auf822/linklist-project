@@ -1,10 +1,12 @@
 #ifndef CONTACTBOOK_H
 #define CONTACTBOOK_H
+
 #include "LinkList.h"
-#include <fstream>
 #include <iomanip>
 #include <string>
+#include <utility>
 
+// 联系人类：参考 AddressBook.cpp 的字段和类型转换运算符。
 struct Contact {
     int id = 0;
     std::string name, phone, email;
@@ -23,7 +25,7 @@ inline std::ostream& operator<<(std::ostream& out, const Contact& c) {
 struct Group {
     int id = 0;
     std::string name;
-    LinkList<Contact> contacts;       // 内层链表：该分组的联系人
+    LinkList<Contact> contacts;       // 内层链表：本分组的联系人
     Group() = default;
     Group(int i, std::string n) : id(i), name(std::move(n)) {}
     operator int() const { return id; }
@@ -38,7 +40,6 @@ inline std::ostream& operator<<(std::ostream& out, const Group& g) {
     return out;
 }
 
-// 管理类：把两层链表组织起来，界面在 main.cpp 中。
 class ContactBook {
 private:
     LinkList<Group> groups_;          // 外层链表：所有分组
@@ -47,14 +48,18 @@ public:
     const LinkList<Group>& Groups() const { return groups_; }
 
     Group* FindGroup(int id) {
-        Node<Group>* p = groups_.Locate(id, true);
-        return p ? &groups_.CurData() : nullptr;
+        if (groups_.Locate(id, true) == NULL) return nullptr;
+        return &groups_.CurData();
     }
 
-    bool HasContact(int id) const {
-        for (const Node<Group>* g = groups_.First(); g; g = g->next)
-            for (const Node<Contact>* c = g->data.contacts.First(); c; c = c->next)
-                if (c->data.id == id) return true;
+    // 原版 Node 的 data/next 是私有的，必须通过 LinkList 的公有接口遍历。
+    // 遍历会改变链表的“当前结点”，因此这些成员函数不声明为 const。
+    bool HasContact(int id) {
+        for (groups_.GoTop(); groups_.CurNode() != NULL; groups_.Skip()) {
+            LinkList<Contact>& contacts = groups_.CurData().contacts;
+            for (contacts.GoTop(); contacts.CurNode() != NULL; contacts.Skip())
+                if (contacts.CurData().id == id) return true;
+        }
         return false;
     }
 
@@ -65,28 +70,34 @@ public:
     }
 
     bool DeleteGroup(int id) {
-        return FindGroup(id) && groups_.DeleteCurrent();
-    }
-
-    bool AddContact(int groupId, const Contact& contact) {
-        Group* g = FindGroup(groupId);
-        if (!g || contact.id <= 0 || contact.name.empty() || contact.phone.empty()
-            || HasContact(contact.id)) return false;
-        g->contacts.Append(contact);
+        if (!FindGroup(id)) return false;
+        // 原版返回被删数据（这里为 Group），临时对象随后也会自动析构。
+        groups_.DeleteCurNode();
         return true;
     }
 
-    bool UpdateContact(int groupId, const Contact& value) {
+    bool AddContact(int groupId, const Contact& c) {
         Group* g = FindGroup(groupId);
-        if (!g || value.name.empty() || value.phone.empty()
-            || !g->contacts.Locate(value.id, true)) return false;
-        g->contacts.CurData() = value; // 保留编号，修改其它信息
+        if (!g || c.id <= 0 || c.name.empty() || c.phone.empty() || HasContact(c.id))
+            return false;
+        // HasContact 改变了游标，但不删除结点，前面得到的 g 仍然有效。
+        g->contacts.Append(c);
+        return true;
+    }
+
+    bool UpdateContact(int groupId, const Contact& c) {
+        Group* g = FindGroup(groupId);
+        if (!g || c.name.empty() || c.phone.empty() || !g->contacts.Locate(c.id, true))
+            return false;
+        g->contacts.ModifyData(c);     // 使用原版的修改接口
         return true;
     }
 
     bool DeleteContact(int groupId, int id) {
         Group* g = FindGroup(groupId);
-        return g && g->contacts.Locate(id, true) && g->contacts.DeleteCurrent();
+        if (!g || !g->contacts.Locate(id, true)) return false;
+        g->contacts.DeleteCurNode();  // 使用原版的删除接口
+        return true;
     }
 
     bool MoveContact(int sourceId, int targetId, int contactId) {
@@ -95,30 +106,40 @@ public:
         Group* target = FindGroup(targetId);
         if (!source || !target || !source->contacts.Locate(contactId, true))
             return false;
-        // 先追加成功再删除，避免追加失败时丢失联系人。
         target->contacts.Append(source->contacts.CurData());
-        source->contacts.DeleteCurrent();
+        source->contacts.DeleteCurNode();
         return true;
     }
 
-    std::size_t ContactCount() const {
+    std::size_t ContactCount() {
         std::size_t total = 0;
-        for (const Node<Group>* g = groups_.First(); g; g = g->next)
-            total += g->data.contacts.NumNodes();
+        for (groups_.GoTop(); groups_.CurNode() != NULL; groups_.Skip())
+            total += groups_.CurData().contacts.NumNodes();
         return total;
     }
 
-    std::size_t Search(const std::string& keyword, std::ostream& out) const {
+    void Statistics(std::ostream& out) {
+        for (groups_.GoTop(); groups_.CurNode() != NULL; groups_.Skip()) {
+            const Group& g = groups_.CurData();
+            out << "[" << g.id << "] " << g.name << ": "
+                << g.contacts.NumNodes() << " 人\n";
+        }
+        out << "共 " << groups_.NumNodes() << " 个分组，"
+            << ContactCount() << " 位联系人。\n";
+    }
+
+    std::size_t Search(const std::string& keyword, std::ostream& out) {
         std::size_t count = 0;
-        // 两重遍历：先访问外层分组，再访问这个分组的内层联系人。
-        for (const Node<Group>* g = groups_.First(); g; g = g->next) {
-            for (const Node<Contact>* p = g->data.contacts.First(); p; p = p->next) {
-                const Contact& c = p->data;
+        // 两重循环体现“链表的链表”：先遍历分组，再遍历本组联系人。
+        for (groups_.GoTop(); groups_.CurNode() != NULL; groups_.Skip()) {
+            Group& g = groups_.CurData();
+            for (g.contacts.GoTop(); g.contacts.CurNode() != NULL; g.contacts.Skip()) {
+                const Contact& c = g.contacts.CurData();
                 if (std::to_string(c.id) == keyword
                     || c.name.find(keyword) != std::string::npos
                     || c.phone.find(keyword) != std::string::npos
                     || c.email.find(keyword) != std::string::npos) {
-                    out << "[" << g->data.name << "] " << c << '\n';
+                    out << "[" << g.name << "] " << c << '\n';
                     ++count;
                 }
             }
@@ -126,26 +147,26 @@ public:
         return count;
     }
 
-    // 分层保存：G 是分组记录，C 是其下的联系人记录。
-    // quoted 允许文本含空格、双引号和反斜杠。
-    bool Save(const std::string& filename) const {
+    // 按“分组记录 + 该组联系人记录”保存，沿用上一版的数据文件格式。
+    // 文件读写在应用层实现；原版 LinkList 的 Save/Load、GetList 未改动。
+    bool Save(const std::string& filename) {
         std::ofstream out(filename);
         if (!out) return false;
         out << "GROUPED_ADDRESS_BOOK_V1\n" << groups_.NumNodes() << '\n';
-        for (const Node<Group>* g = groups_.First(); g; g = g->next) {
-            out << "G " << g->data.id << ' ' << std::quoted(g->data.name)
-                << ' ' << g->data.contacts.NumNodes() << '\n';
-            for (const Node<Contact>* p = g->data.contacts.First(); p; p = p->next) {
-                const Contact& c = p->data;
-                out << "C " << c.id << ' ' << std::quoted(c.name)
-                    << ' ' << std::quoted(c.phone) << ' ' << std::quoted(c.email) << '\n';
+        for (groups_.GoTop(); groups_.CurNode() != NULL; groups_.Skip()) {
+            Group& g = groups_.CurData();
+            out << "G " << g.id << ' ' << std::quoted(g.name)
+                << ' ' << g.contacts.NumNodes() << '\n';
+            for (g.contacts.GoTop(); g.contacts.CurNode() != NULL; g.contacts.Skip()) {
+                const Contact& c = g.contacts.CurData();
+                out << "C " << c.id << ' ' << std::quoted(c.name) << ' '
+                    << std::quoted(c.phone) << ' ' << std::quoted(c.email) << '\n';
             }
         }
         out.close();
         return static_cast<bool>(out);
     }
 
-    // 在临时通讯录中校验，全部成功后才替换；失败不会清空现有数据。
     bool Load(const std::string& filename) {
         std::ifstream in(filename);
         std::string header;
@@ -172,8 +193,9 @@ public:
             }
         }
         in >> std::ws;
-        if (!in.eof()) return false; // 拒绝尾部多余数据
-        groups_.Swap(temp.groups_);
+        if (!in.eof()) return false;
+        // 原版没有 Swap()，直接使用原版已经实现的深赋值。
+        groups_ = temp.groups_;
         return true;
     }
 };
